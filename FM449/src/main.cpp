@@ -98,9 +98,9 @@ void setup() {
     pinMode(pinBLUE, OUTPUT);
     pinMode(pinBUZZER, OUTPUT);
 
-    digitalWrite(pinRED, HIGH);
-    digitalWrite(pinGREEN, HIGH);
-    digitalWrite(pinBLUE, HIGH);
+    digitalWrite(pinRED, LOW);
+    digitalWrite(pinGREEN, LOW);
+    digitalWrite(pinBLUE, LOW);
     digitalWrite(pinBUZZER, LOW);
     
     // Configuracao do sensor
@@ -120,36 +120,36 @@ void setup() {
 void loop() {
     static unsigned long lastReadTime = 0;
     
-    // Realiza a leitura a cada 20 segundos (20000 ms)
-    if (millis() - lastReadTime > 20000) {
+    // Realiza a leitura a cada 5 segundos (5000 ms)
+    if (millis() - lastReadTime > 5000) {
         readSensorData();
         printSensorData();
 
         // Reseta o LED (apaga todas as cores)
-        digitalWrite(pinRED, HIGH);
-        digitalWrite(pinGREEN, HIGH);
-        digitalWrite(pinBLUE, HIGH);
+        digitalWrite(pinRED, LOW);
+        digitalWrite(pinGREEN, LOW);
+        digitalWrite(pinBLUE, LOW);
 
         // Aciona o hardware conforme o nivel
         // 1 = bom (verde), 2 = moderado (amarelo), 3 = ruim (vermelho), 4 = critico (magenta + buzzer)
         switch (sensorData.airQualityLevel) {
             case 1:
                 // LED verde
-                digitalWrite(pinGREEN, LOW);
+                digitalWrite(pinGREEN, HIGH);
                 break;
             case 2:
                 // LED amarelo
-                digitalWrite(pinRED, LOW);
-                digitalWrite(pinGREEN, LOW);
+                digitalWrite(pinRED, HIGH);
+                digitalWrite(pinGREEN, HIGH);
                 break;
             case 3:
                 // LED vermelho
-                digitalWrite(pinRED, LOW);
+                digitalWrite(pinRED, HIGH);
                 break;
             case 4:
                 // LED magenta + Buzzer
-                digitalWrite(pinRED, LOW);
-                digitalWrite(pinBLUE, LOW);
+                digitalWrite(pinRED, HIGH);
+                digitalWrite(pinBLUE, HIGH);
                 activateBuzzer();
                 break;
         }
@@ -251,7 +251,7 @@ void activateBuzzer() {
 }
 
 void updateBuzzer() {
-    if (buzzerAtivo && millis() - BuzzerBeginTime > 3000) {
+    if (buzzerAtivo && millis() - BuzzerBeginTime > 1000) {
         digitalWrite(pinBUZZER, LOW);
         buzzerAtivo = false;
     }
@@ -262,11 +262,11 @@ void calibrarSensor() {
     Serial.println("Mantenha o ambiente limpo. Aguarde alguns segundos.");
 
     // Acende o LED em Branco (Vermelho + Verde + Azul ativos) durante a calibracao
-    digitalWrite(pinRED, LOW);
-    digitalWrite(pinGREEN, LOW);
-    digitalWrite(pinBLUE, LOW);
+    digitalWrite(pinRED, HIGH);
+    digitalWrite(pinGREEN, HIGH);
+    digitalWrite(pinBLUE, HIGH);
 
-    int numeroLeituras = 30;
+    int numeroLeituras = 10;
     float somaDasLeituras = 0.0;
     float leituraAtual;
 
@@ -280,13 +280,13 @@ void calibrarSensor() {
         somaDasLeituras += leituraAtual; 
 
         Serial.print("#");
-        delay(1000);
+        delay(5000);
     }
 
     // Apaga o LED branco ao finalizar a calibracao
-    digitalWrite(pinRED, HIGH);
-    digitalWrite(pinGREEN, HIGH);
-    digitalWrite(pinBLUE, HIGH);
+    digitalWrite(pinRED, LOW);
+    digitalWrite(pinGREEN, LOW);
+    digitalWrite(pinBLUE, LOW);
 
     // Garante que a fila comece limpa apos a calibracao
     limpar_fila(&filaResistencia);
@@ -301,10 +301,10 @@ void calibrarSensor() {
 }
 
 void updateLED() {
-    if (ledAtivo && (millis() - LedBeginTime > 5000)) {
-        digitalWrite(pinRED, HIGH);
-        digitalWrite(pinGREEN, HIGH);
-        digitalWrite(pinBLUE, HIGH);
+    if (ledAtivo && (millis() - LedBeginTime > 3000)) {
+        digitalWrite(pinRED, LOW);
+        digitalWrite(pinGREEN, LOW);
+        digitalWrite(pinBLUE, LOW);
         ledAtivo = false;
     }
 }
