@@ -1,382 +1,688 @@
+// segredos.h precisa vir ANTES do BlynkSimpleEsp32.h (define TEMPLATE_ID, NAME e AUTH_TOKEN)
+#include "segredos.h"
+
+#include <Arduino.h>
 #include <Wire.h>
-#include <SPI.h>
-#include <Adafruit_Sensor.h>
-#include <Adafruit_BME680.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <LittleFS.h>
+#include <BlynkSimpleEsp32.h>
 
-#define SEALEVELPRESSURE_HPA (1013.25)
-#define TAMANHO_JANELA_MEDIA 5 // Quantidade 'N' de leituras na fila para a media movel
+// =====================================================================
+//  INCLUDES EXATOS DA SUA PASTA "include/"
+// =====================================================================
+extern "C" {
+    #include "bme68x.h"
+    #include "bme68x_defs.h"
+    #include "bsec_datatypes.h"
+    #include "bsec_interface.h"
+    #include "bsec_iaq.h"
+}
 
-// ---------------- ESTRUTURAS DA FILA ----------------
-typedef struct No {
-    float dado;
-    struct No *prox;
-} No;
+// ---------------- CONFIGURACAO DO HARDWARE ----------------
+constexpr uint8_t PIN_R      = 4;
+constexpr uint8_t PIN_G      = 5;
+constexpr uint8_t PIN_B      = 18;
+constexpr uint8_t PIN_BUZZER = 15;
 
-typedef struct {
-    No *inicio;
-    No *fim;
-    int tamanho;
-    int capacidade_max;
-    float soma; // Acumulador para calcular a media em O(1)
-} Fila;
+// Limites SUPERIORES de IAQ (0-500) para Bom, Moderado e Ruim. Acima = Critico.
+constexpr float   LIMITE_SUP[3]   = {100.0f, 200.0f, 300.0f};
+constexpr float   HISTERESE       = 10.0f;
+constexpr uint8_t ACURACIA_MINIMA = 1;
 
-// ---------------- HARDWARE E VARIAVEIS GLOBAIS ----------------
-// Pinos do LED e do Buzzer
-const int pinRED = 13;
-const int pinGREEN = 12;
-const int pinBLUE = 14;
-const int pinBUZZER = 15;
+// Intervalo de backup da calibracao na bancada: 30 minutos (em milissegundos)
+constexpr uint32_t INTERVALO_SALVAR_MS = 30UL * 60UL * 1000UL;
 
-// Variaveis para o controle do Buzzer e do LED
-unsigned long BuzzerBeginTime = 0;
-bool buzzerAtivo = false;
-unsigned long LedBeginTime = 0;
-bool ledAtivo = false;
+// ---------------- CONFIGURACAO DO BLYNK ----------------
+constexpr uint32_t INTERVALO_TENTATIVA_BLYNK_MS = 10000;
+uint32_t           ultimaTentativaBlynkMs       = 0;
 
-// Resistencia de referencia do sensor
-float R0 = 0.0;
+// ---------------- CONFIGURACAO DO LOG EM ARQUIVO (LittleFS) ----------------
+constexpr const char *ARQUIVO_LOG          = "/log_iaq.csv";
+constexpr uint8_t     LOG_ACURACIA_MINIMA  = ACURACIA_MINIMA;   // mesma condicao que encerra o "Aquecendo". Suba p/ 2 ou 3 se quiser so dados bem calibrados
+constexpr size_t      LOG_TAMANHO_MAX      = 500UL * 1024UL;    // para de gravar ao passar disso (~500 KB)
 
-Adafruit_BME680 bme; // I2C
+bool     fsOk        = false;
+bool     logIniciado = false;
+bool     logCheio    = false;
+uint32_t sessaoLog   = 0;   // numero da sessao (incrementa a cada boot que chega a gravar)
+uint32_t inicioLogMs = 0;   // millis() no momento em que o log comecou (t = 0 do grafico)
 
-// Estrutura de dados do sensor
-struct SensorData {
-    float temperature;
-    float humidity;
-    float pressure;
-    float gasResistance;      // Resistencia instantanea lida (kOhms)
-    float gasResistanceMedia; // Media movel das ultimas N resistencias (kOhms)
-    float altitude;
-    float dewPoint;
-    int airQualityLevel;
-    float razao_R;
-    unsigned long lastUpdate;
-};
+// Tamanhos seguros de buffer (previne erro caso bsec_datatypes.h seja de versao diferente da .a)
+constexpr uint32_t SAFE_WORKBUFFER_SIZE = (BSEC_MAX_WORKBUFFER_SIZE > 4096) ? BSEC_MAX_WORKBUFFER_SIZE : 4096;
+constexpr uint32_t SAFE_STATE_BLOB_SIZE = (BSEC_MAX_STATE_BLOB_SIZE > 1024) ? BSEC_MAX_STATE_BLOB_SIZE : 1024;
 
-SensorData sensorData;
-Fila filaResistencia; // Instancia global da fila de media movel
+// ---------------- ESTADOS E VARIAVEIS GLOBAIS ----------------
+enum Estado : uint8_t { AQUECENDO, BOM, MODERADO, RUIM, CRITICO, ERRO };
+const char *NOMES[] = {"Aquecendo", "Bom", "Moderado", "Ruim", "Critico", "Erro"};
 
-// ---------------- PROTOTIPOS DAS FUNCOES ----------------
-// Funcoes do Sensor e Perifericos
-void readSensorData();
-float dewPointCalculation(float temperature, float humidity);
-void printSensorData();
-void activateBuzzer();
-void updateBuzzer();
-void updateLED();
-void calibrarSensor();
-int calculateAirQualityLevel(float razao_R);
+Estado estado   = AQUECENDO;
+bool   sensorOk = false;
 
-// Funcoes da Fila (Lista Ligada)
-Fila cria_fila(int capacidade_max);
-void enqueue(Fila *fila, float valor);
-void dequeue(Fila *fila);
-float obter_media_fila(Fila *fila);
-void limpar_fila(Fila *fila);
+// Variaveis das leituras
+float   val_iaq       = 0.0f; // IAQ Adaptativo (memoria recente - detecta picos)
+float   val_staticIaq = 0.0f; // IAQ Estatico (absoluto - mede exposicao continua)
+float   val_bVoc      = 0.0f; // Concentracao equivalente de COVs em ppm
+float   val_temp      = 0.0f; // Temperatura compensada (C)
+float   val_umidade   = 0.0f; // Umidade compensada (%)
+uint8_t val_acuracia  = 0;    // Status da calibracao (0 a 3)
 
-// ---------------- SETUP E LOOP ----------------
-void setup() {
-    Serial.begin(115200);
-    delay(100);
-    
-    Serial.println(F("BME688 Environmental Monitor - Inicializando..."));
-    
-    if (!bme.begin()) {
-        Serial.println("Nao foi possivel encontrar um sensor BME688 valido, verifique as conexoes!");
-        while (1) {
-            delay(1000);
+// Controle do BME688 e da BSEC
+struct bme68x_dev   bme;
+bsec_bme_settings_t sensor_settings;
+uint8_t             EnderecoI2C = BME68X_I2C_ADDR_HIGH; // Sera descoberto automaticamente
+uint8_t             work_buffer[SAFE_WORKBUFFER_SIZE];
+uint8_t             serialized_state[SAFE_STATE_BLOB_SIZE];
+
+// Controle da Memoria Flash (NVS) e Relogio de 64 bits em nanossegundos
+Preferences preferencias;
+uint32_t    ultimoSaveMs         = 0;
+uint8_t     maiorAcuraciaSalva   = 0;
+uint8_t     maiorAcuraciaTentada = 0;
+uint32_t    totalSavesSessao     = 0;
+uint32_t    ultimoMillis         = 0;
+int64_t     tempoAcumuladoNs     = 0;
+
+// Prototipo (usado pelo BLYNK_WRITE antes da definicao)
+void salvarCalibracaoNaMemoria(bool forcarAgora);
+
+// =====================================================================
+//  1. CALLBACKS I2C E AUTO-DETECCAO DE ENDERECO (0x77 E 0x76)
+// =====================================================================
+BME68X_INTF_RET_TYPE bme68x_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *intf_ptr) {
+    uint8_t dev_addr = *(uint8_t*)intf_ptr;
+    Wire.beginTransmission(dev_addr);
+    Wire.write(reg_addr);
+    if (Wire.endTransmission(false) != 0) return -1;
+    Wire.requestFrom(dev_addr, (uint8_t)len);
+    for (uint32_t i = 0; i < len && Wire.available(); i++) {
+        reg_data[i] = Wire.read();
+    }
+    return BME68X_OK;
+}
+
+BME68X_INTF_RET_TYPE bme68x_i2c_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t len, void *intf_ptr) {
+    uint8_t dev_addr = *(uint8_t*)intf_ptr;
+    Wire.beginTransmission(dev_addr);
+    Wire.write(reg_addr);
+    Wire.write(reg_data, len);
+    if (Wire.endTransmission() != 0) return -1;
+    return BME68X_OK;
+}
+
+void bme68x_delay_us(uint32_t period, void *intf_ptr) {
+    delayMicroseconds(period);
+}
+
+// Testa automaticamente os dois enderecos I2C possiveis do BME688 (0x77 e 0x76)
+int8_t inicializarSensorAutoI2C() {
+    const uint8_t enderecosPossiveis[2] = {BME68X_I2C_ADDR_HIGH, BME68X_I2C_ADDR_LOW}; // 0x77 e 0x76
+
+    for (uint8_t i = 0; i < 2; i++) {
+        EnderecoI2C = enderecosPossiveis[i];
+
+        Wire.beginTransmission(EnderecoI2C);
+        if (Wire.endTransmission() == 0) {
+            bme.intf     = BME68X_I2C_INTF;
+            bme.read     = bme68x_i2c_read;
+            bme.write    = bme68x_i2c_write;
+            bme.delay_us = bme68x_delay_us;
+            bme.intf_ptr = &EnderecoI2C;
+            bme.amb_temp = 25;
+
+            int8_t rslt = bme68x_init(&bme);
+            if (rslt == BME68X_OK) {
+                Serial.printf("[I2C] BME688 encontrado e inicializado no endereco 0x%02X!\n", EnderecoI2C);
+                return BME68X_OK;
+            }
         }
     }
 
-    // Inicializa a fila com o tamanho definido para a media movel
-    filaResistencia = cria_fila(TAMANHO_JANELA_MEDIA);
+    Serial.println("[I2C] ERRO: BME688 nao respondeu nem em 0x77 nem em 0x76!");
+    return BME68X_E_DEV_NOT_FOUND;
+}
 
-    // Configuracao dos pinos do LED e do buzzer
-    pinMode(pinRED, OUTPUT);
-    pinMode(pinGREEN, OUTPUT);
-    pinMode(pinBLUE, OUTPUT);
-    pinMode(pinBUZZER, OUTPUT);
+// Gera timestamp em nanossegundos (int64_t) sem risco de overflow do millis()
+int64_t getTimestampNs() {
+    uint32_t agora = millis();
+    tempoAcumuladoNs += (int64_t)(agora - ultimoMillis) * 1000000LL;
+    ultimoMillis = agora;
+    return tempoAcumuladoNs;
+}
 
-    digitalWrite(pinRED, LOW);
-    digitalWrite(pinGREEN, LOW);
-    digitalWrite(pinBLUE, LOW);
-    digitalWrite(pinBUZZER, LOW);
-    
-    // Configuracao do sensor
-    // Segundo o datasheet, e recomendado iniciar umidade, temperatura e pressao nesta ordem
-    bme.setHumidityOversampling(BME680_OS_4X);
-    bme.setTemperatureOversampling(BME680_OS_8X);
-    bme.setPressureOversampling(BME680_OS_4X);
-    bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-    bme.setGasHeater(320, 150); // 320 C por 150 ms
-    Serial.println("Configuracao do sensor BME688 concluida.\n");
+// =====================================================================
+//  2. FUNCOES DE MEMORIA FLASH (CARREGAR NO BOOT E SALVAR CALIBRACAO)
+// =====================================================================
+void carregarCalibracaoDaMemoria() {
+    if (!preferencias.begin("bsec_mem", false)) {
+        Serial.println("[MEMORIA] Erro ao abrir o namespace NVS.");
+        return;
+    }
 
-    calibrarSensor(); // Realiza a calibracao com o LED branco aceso
-    readSensorData(); // Primeira leitura ja aplicando a fila
-    printSensorData();
+    if (preferencias.isKey("state")) {
+        size_t tam = preferencias.getBytesLength("state");
+        if (tam > 0 && tam <= SAFE_STATE_BLOB_SIZE) {
+            preferencias.getBytes("state", serialized_state, tam);
+            bsec_library_return_t status = bsec_set_state(
+                serialized_state, tam, work_buffer, SAFE_WORKBUFFER_SIZE
+            );
+            if (status >= BSEC_OK) {
+                maiorAcuraciaSalva   = preferencias.getUChar("saved_acc", 1);
+                maiorAcuraciaTentada = maiorAcuraciaSalva;
+                ultimoSaveMs         = millis();
+                Serial.println("==========================================================");
+                Serial.printf("[MEMORIA] Calibracao restaurada da Flash! (%u bytes | acc salva: %u | status: %d)\n",
+                              (uint32_t)tam, maiorAcuraciaSalva, status);
+                Serial.println("==========================================================");
+            } else {
+                Serial.printf("[MEMORIA] Estado salvo invalido (erro %d). Iniciando do zero.\n", status);
+            }
+        }
+    } else {
+        Serial.println("[MEMORIA] Nenhuma calibracao salva encontrada. Iniciando do zero.");
+    }
+    preferencias.end();
+}
+
+void salvarCalibracaoNaMemoria(bool forcarAgora = false) {
+    uint32_t agora = millis();
+
+    // Usa maiorAcuraciaTentada para nao ficar preso num loop infinito se bsec_get_state falhar
+    bool subiuDeNivel    = (val_acuracia > maiorAcuraciaTentada);
+    bool salvarPeriodico = (val_acuracia >= 1 && (agora - ultimoSaveMs >= INTERVALO_SALVAR_MS));
+
+    if (forcarAgora || subiuDeNivel || salvarPeriodico) {
+        if (val_acuracia > maiorAcuraciaTentada) {
+            maiorAcuraciaTentada = val_acuracia;
+        }
+        ultimoSaveMs = agora;
+
+        uint32_t n_serialized_state = 0;
+
+        // Tentativa 1: Usa os buffers expandidos seguros (SAFE_STATE_BLOB_SIZE / SAFE_WORKBUFFER_SIZE)
+        bsec_library_return_t status = bsec_get_state(
+            0, serialized_state, SAFE_STATE_BLOB_SIZE,
+            work_buffer, SAFE_WORKBUFFER_SIZE, &n_serialized_state
+        );
+
+        // Tentativa 2: Se a lib exigir exatamente a constante do header, tenta com BSEC_MAX_STATE_BLOB_SIZE
+        if (status < BSEC_OK) {
+            status = bsec_get_state(
+                0, serialized_state, BSEC_MAX_STATE_BLOB_SIZE,
+                work_buffer, BSEC_MAX_WORKBUFFER_SIZE, &n_serialized_state
+            );
+        }
+
+        if (status >= BSEC_OK && n_serialized_state > 0) {
+            if (preferencias.begin("bsec_mem", false)) {
+                size_t gravados = preferencias.putBytes("state", serialized_state, n_serialized_state);
+                if (val_acuracia > maiorAcuraciaSalva) {
+                    maiorAcuraciaSalva = val_acuracia;
+                }
+                preferencias.putUChar("saved_acc", maiorAcuraciaSalva);
+                preferencias.end();
+
+                totalSavesSessao++;
+
+                const char *motivo = forcarAgora ? "Comando manual (serial 's' ou botao Blynk)" :
+                                     (subiuDeNivel ? "Subiu de nivel de acuracia" : "Backup periodico (30 min)");
+
+                Serial.println("\n**********************************************************");
+                Serial.printf(">>> [FLASH NVS] CALIBRACAO SALVA COM SUCESSO! (Save #%u) <<<\n", totalSavesSessao);
+                Serial.printf(">>> Motivo: %s\n", motivo);
+                Serial.printf(">>> Status BSEC: %d | Acuracia atual: %u | Gravados: %u/%u bytes\n",
+                              status, val_acuracia, (uint32_t)gravados, n_serialized_state);
+                Serial.println("**********************************************************\n");
+            } else {
+                Serial.println("\n[ERRO FLASH] Falha ao abrir NVS 'bsec_mem' para escrita!\n");
+            }
+        } else {
+            Serial.printf("\n[AVISO BSEC] bsec_get_state indisponivel (status=%d | tam=%u | Header MAX_STATE=%u, MAX_WORK=%u).\n",
+                          status, n_serialized_state, (uint32_t)BSEC_MAX_STATE_BLOB_SIZE, (uint32_t)BSEC_MAX_WORKBUFFER_SIZE);
+        }
+    }
+}
+
+void inspecionarMemoriaFlash() {
+    if (!preferencias.begin("bsec_mem", true)) {
+        Serial.println("\n[INSPECAO FLASH] Namespace 'bsec_mem' ainda nao existe na NVS.\n");
+        return;
+    }
+    bool temState = preferencias.isKey("state");
+    size_t tam    = temState ? preferencias.getBytesLength("state") : 0;
+    uint8_t acc   = preferencias.getUChar("saved_acc", 0);
+    preferencias.end();
+
+    Serial.println("\n------------------ STATUS DA FLASH NVS ------------------");
+    Serial.printf("Chave 'state' existe? %s | Tamanho: %u bytes | Maior acc salva: %u | Saves nesta sessao: %u\n",
+                  temState ? "SIM" : "NAO", (uint32_t)tam, acc, totalSavesSessao);
+    Serial.printf("Constantes do Header -> BSEC_MAX_STATE_BLOB_SIZE: %u | BSEC_MAX_WORKBUFFER_SIZE: %u\n",
+                  (uint32_t)BSEC_MAX_STATE_BLOB_SIZE, (uint32_t)BSEC_MAX_WORKBUFFER_SIZE);
+    Serial.println("---------------------------------------------------------\n");
+}
+
+// =====================================================================
+//  3. BLYNK IOT (WiFi nao bloqueante)
+// =====================================================================
+// V0 IAQ | V1 sIAQ | V2 bVOC | V3 Temp | V4 Umidade | V5 Acuracia | V6 Estado (string)
+// V7 (botao, entrada): salva calibracao na Flash
+
+BLYNK_WRITE(V7) {
+    if (param.asInt() == 1) {
+        Serial.println("\n[BLYNK] Salvamento manual solicitado pelo app.");
+        salvarCalibracaoNaMemoria(true);
+    }
+}
+
+BLYNK_CONNECTED() {
+    Serial.println("[BLYNK] Conectado ao servidor!");
+}
+
+void iniciarConexao() {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);   // retorna na hora; conecta em background
+    Blynk.config(BLYNK_AUTH_TOKEN);     // so configura, nao conecta
+}
+
+void gerenciarConexao() {
+    if (WiFi.status() != WL_CONNECTED) return;  // auto-reconnect cuida do WiFi
+
+    if (Blynk.connected()) {
+        Blynk.run();
+        return;
+    }
+
+    uint32_t agora = millis();
+    if (agora - ultimaTentativaBlynkMs >= INTERVALO_TENTATIVA_BLYNK_MS) {
+        ultimaTentativaBlynkMs = agora;
+        Serial.println("[BLYNK] Tentando conectar...");
+        Blynk.connect(3000);  // bloqueia no maximo 3 s
+    }
+}
+
+void enviarParaBlynk() {
+    if (!Blynk.connected()) return;
+
+    Blynk.virtualWrite(V0, val_iaq);
+    Blynk.virtualWrite(V1, val_staticIaq);
+    Blynk.virtualWrite(V2, val_bVoc);
+    Blynk.virtualWrite(V3, val_temp);
+    Blynk.virtualWrite(V4, val_umidade);
+    Blynk.virtualWrite(V5, val_acuracia);
+    Blynk.virtualWrite(V6, NOMES[estado]);
+}
+
+// =====================================================================
+//  3.5 LOG EM ARQUIVO CSV (LittleFS) - so grava depois do aquecimento
+// =====================================================================
+// Formato: sessao,tempo_s,iaq,iaq_estatico,acuracia
+// tempo_s = segundos desde o fim do aquecimento (t = 0 na primeira linha da sessao)
+void registrarLog() {
+    if (!fsOk || logCheio) return;
+    if (estado == AQUECENDO || val_acuracia < LOG_ACURACIA_MINIMA) return;
+
+    if (!logIniciado) {
+        if (preferencias.begin("log_iaq", false)) {
+            sessaoLog = preferencias.getUInt("sessao", 0) + 1;
+            preferencias.putUInt("sessao", sessaoLog);
+            preferencias.end();
+        }
+        inicioLogMs = millis();
+        logIniciado = true;
+        Serial.printf("[LOG] Aquecimento concluido. Iniciando log (sessao %u) em %s\n", sessaoLog, ARQUIVO_LOG);
+    }
+
+    bool novoArquivo = !LittleFS.exists(ARQUIVO_LOG);
+    File f = LittleFS.open(ARQUIVO_LOG, FILE_APPEND);
+    if (!f) {
+        Serial.println("[LOG] ERRO: nao foi possivel abrir o arquivo de log.");
+        return;
+    }
+
+    if (f.size() >= LOG_TAMANHO_MAX) {
+        f.close();
+        logCheio = true;
+        Serial.println("[LOG] Arquivo cheio. Gravacao interrompida (use 'd' para baixar e 'x' para apagar).");
+        return;
+    }
+
+    if (novoArquivo) f.println("sessao,tempo_s,iaq,iaq_estatico,acuracia");
+    f.printf("%u,%.1f,%.1f,%.1f,%u\n",
+             sessaoLog, (millis() - inicioLogMs) / 1000.0f, val_iaq, val_staticIaq, val_acuracia);
+    f.close();
+}
+
+// Despeja o CSV inteiro na serial (copie do monitor serial e salve como .csv)
+void imprimirLog() {
+    if (!fsOk || !LittleFS.exists(ARQUIVO_LOG)) {
+        Serial.println("\n[LOG] Nenhum arquivo de log ainda (ele so e criado depois do aquecimento).\n");
+        return;
+    }
+    File f = LittleFS.open(ARQUIVO_LOG, FILE_READ);
+    if (!f) {
+        Serial.println("\n[LOG] ERRO ao abrir o log para leitura.\n");
+        return;
+    }
+    Serial.printf("\n----- INICIO %s (%u bytes) -----\n", ARQUIVO_LOG, (uint32_t)f.size());
+    uint8_t buf[256];
+    while (f.available()) {
+        size_t n = f.read(buf, sizeof(buf));
+        Serial.write(buf, n);
+    }
+    f.close();
+    Serial.println("----- FIM DO LOG -----\n");
+}
+
+void apagarLog() {
+    if (fsOk && LittleFS.exists(ARQUIVO_LOG) && LittleFS.remove(ARQUIVO_LOG)) {
+        logCheio = false;
+        Serial.println("\n[LOG] Arquivo de log apagado.\n");
+    } else {
+        Serial.println("\n[LOG] Nada para apagar.\n");
+    }
+}
+
+// =====================================================================
+//  4. LOGICA DE CLASSIFICACAO, HISTERESE, LEDS, BUZZER E SERIAL
+// =====================================================================
+bool ciclo(uint32_t agora, uint32_t periodo, uint32_t ligado) {
+    return (agora % periodo) < ligado;
+}
+
+Estado classificar(float iaq, Estado atual) {
+    Estado novo = CRITICO;
+    for (uint8_t i = 0; i < 3; i++) {
+        if (iaq <= LIMITE_SUP[i]) {
+            novo = (Estado)(BOM + i);
+            break;
+        }
+    }
+    if (atual >= BOM && atual <= CRITICO && novo < atual &&
+        iaq > LIMITE_SUP[atual - BOM - 1] - HISTERESE) {
+        novo = atual;
+    }
+    return novo;
+}
+
+void atualizarEstado() {
+    if (val_acuracia < ACURACIA_MINIMA) {
+        estado = AQUECENDO;
+    } else {
+        float iaqParaAlerta = (val_iaq > val_staticIaq) ? val_iaq : val_staticIaq;
+        estado = classificar(iaqParaAlerta, estado);
+    }
+}
+
+void imprimir() {
+    uint32_t decorridoMs = millis() - ultimoSaveMs;
+    uint32_t restanteSeg = (decorridoMs < INTERVALO_SALVAR_MS)
+                           ? ((INTERVALO_SALVAR_MS - decorridoMs) / 1000UL)
+                           : 0;
+    uint32_t minRest = restanteSeg / 60UL;
+    uint32_t segRest = restanteSeg % 60UL;
+
+    Serial.printf("IAQ: %.0f | sIAQ: %.0f (acc %u) | bVOC: %.2f ppm | T: %.1f C | UR: %.1f%% | %s | [Flash: acc %u | Save #%u | Prox: %02um%02us] | Blynk: %s\n",
+                  val_iaq, val_staticIaq, val_acuracia, val_bVoc,
+                  val_temp, val_umidade, NOMES[estado],
+                  maiorAcuraciaSalva, totalSavesSessao, minRest, segRest,
+                  Blynk.connected() ? "on" : "off");
+}
+
+void atualizarSaidas(uint32_t agora) {
+    bool r = false, g = false, b = false, buzzer = false;
+
+    switch (estado) {
+        case AQUECENDO:
+            b = ciclo(agora, 2000, 1000);
+            break;
+        case BOM:
+            g = true;
+            break;
+        case MODERADO:
+            r = true;
+            g = true;
+            break;
+        case RUIM:
+            r = true;
+            break;
+        case CRITICO:
+            r      = ciclo(agora, 1000, 500);
+            buzzer = ciclo(agora, 1000, 200);
+            break;
+        case ERRO:
+            r = g = b = ciclo(agora, 400, 200);
+            break;
+    }
+
+    digitalWrite(PIN_R, r);
+    digitalWrite(PIN_G, g);
+    digitalWrite(PIN_B, b);
+    digitalWrite(PIN_BUZZER, buzzer);
+}
+
+// =====================================================================
+//  5. PASSO DE LEITURA DO SENSOR + PROCESSAMENTO BSEC
+// =====================================================================
+bool executarPassoBsec() {
+    int64_t time_stamp = getTimestampNs();
+
+    if (time_stamp < sensor_settings.next_call) {
+        return false;
+    }
+
+    bsec_library_return_t bsec_status = bsec_sensor_control(time_stamp, &sensor_settings);
+    if (bsec_status < BSEC_OK) {
+        Serial.printf("[ERRO] bsec_sensor_control: %d\n", bsec_status);
+        sensorOk = false;
+        return false;
+    }
+
+    if (sensor_settings.trigger_measurement == 1) {
+        struct bme68x_conf       conf;
+        struct bme68x_heatr_conf heatr_conf;
+
+        conf.os_hum  = sensor_settings.humidity_oversampling;
+        conf.os_temp = sensor_settings.temperature_oversampling;
+        conf.os_pres = sensor_settings.pressure_oversampling;
+        conf.filter  = BME68X_FILTER_OFF;
+        conf.odr     = BME68X_ODR_NONE;
+        bme68x_set_conf(&conf, &bme);
+
+        heatr_conf.enable     = sensor_settings.run_gas;
+        heatr_conf.heatr_temp = sensor_settings.heater_temperature;
+        heatr_conf.heatr_dur  = sensor_settings.heater_duration;
+        bme68x_set_heatr_conf(BME68X_FORCED_MODE, &heatr_conf, &bme);
+
+        bme68x_set_op_mode(BME68X_FORCED_MODE, &bme);
+
+        uint32_t duracao_us = bme68x_get_meas_dur(BME68X_FORCED_MODE, &conf, &bme)
+                              + ((uint32_t)heatr_conf.heatr_dur * 1000UL);
+        delay((duracao_us / 1000UL) + 5);
+    }
+
+    if (sensor_settings.process_data != 0) {
+        struct bme68x_data data;
+        uint8_t n_fields = 0;
+
+        if (bme68x_get_data(BME68X_FORCED_MODE, &data, &n_fields, &bme) == BME68X_OK && n_fields > 0) {
+            bsec_input_t inputs[BSEC_MAX_PHYSICAL_SENSOR];
+            uint8_t n_inputs = 0;
+
+            if (sensor_settings.process_data & BSEC_PROCESS_TEMPERATURE) {
+                inputs[n_inputs].sensor_id  = BSEC_INPUT_TEMPERATURE;
+                inputs[n_inputs].signal     = data.temperature;
+                inputs[n_inputs].time_stamp = time_stamp;
+                n_inputs++;
+            }
+            if (sensor_settings.process_data & BSEC_PROCESS_HUMIDITY) {
+                inputs[n_inputs].sensor_id  = BSEC_INPUT_HUMIDITY;
+                inputs[n_inputs].signal     = data.humidity;
+                inputs[n_inputs].time_stamp = time_stamp;
+                n_inputs++;
+            }
+            if (sensor_settings.process_data & BSEC_PROCESS_PRESSURE) {
+                inputs[n_inputs].sensor_id  = BSEC_INPUT_PRESSURE;
+                inputs[n_inputs].signal     = data.pressure;
+                inputs[n_inputs].time_stamp = time_stamp;
+                n_inputs++;
+            }
+            if ((sensor_settings.process_data & BSEC_PROCESS_GAS) && (data.status & BME68X_GASM_VALID_MSK)) {
+                inputs[n_inputs].sensor_id  = BSEC_INPUT_GASRESISTOR;
+                inputs[n_inputs].signal     = data.gas_resistance;
+                inputs[n_inputs].time_stamp = time_stamp;
+                n_inputs++;
+            }
+
+            if (n_inputs > 0) {
+                bsec_output_t outputs[BSEC_NUMBER_OUTPUTS];
+                uint8_t n_outputs = BSEC_NUMBER_OUTPUTS;
+
+                bsec_status = bsec_do_steps(inputs, n_inputs, outputs, &n_outputs);
+                if (bsec_status >= BSEC_OK && n_outputs > 0) {
+                    for (uint8_t i = 0; i < n_outputs; i++) {
+                        switch (outputs[i].sensor_id) {
+                            case BSEC_OUTPUT_IAQ:
+                                val_iaq      = outputs[i].signal;
+                                val_acuracia = outputs[i].accuracy;
+                                break;
+                            case BSEC_OUTPUT_STATIC_IAQ:
+                                val_staticIaq = outputs[i].signal;
+                                break;
+                            case BSEC_OUTPUT_BREATH_VOC_EQUIVALENT:
+                                val_bVoc = outputs[i].signal;
+                                break;
+                            case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE:
+                                val_temp = outputs[i].signal;
+                                break;
+                            case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY:
+                                val_umidade = outputs[i].signal;
+                                break;
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// =====================================================================
+//  6. SETUP E LOOP PRINCIPAL
+// =====================================================================
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+
+    pinMode(PIN_R, OUTPUT);
+    pinMode(PIN_G, OUTPUT);
+    pinMode(PIN_B, OUTPUT);
+    pinMode(PIN_BUZZER, OUTPUT);
+
+    Wire.begin();
+    iniciarConexao();   // WiFi + Blynk em background (nao bloqueia)
+
+    fsOk = LittleFS.begin(true);   // true = formata sozinho na primeira vez
+    Serial.println(fsOk ? "[LOG] LittleFS montado." : "[LOG] ERRO: falha ao montar LittleFS (log desativado).");
+
+    int8_t rslt = inicializarSensorAutoI2C();
+
+    bsec_library_return_t bsec_status = bsec_init();
+    bsec_version_t ver;
+    bsec_get_version(&ver);
+    Serial.printf("[BSEC] Versao da lib: %u.%u.%u.%u | bsec_init status: %d\n",
+                  ver.major, ver.minor, ver.major_bugfix, ver.minor_bugfix, bsec_status);
+
+    if (rslt == BME68X_OK && bsec_status == BSEC_OK) {
+        bsec_status = bsec_set_configuration(
+            bsec_config_iaq, sizeof(bsec_config_iaq),
+            work_buffer, SAFE_WORKBUFFER_SIZE
+        );
+
+        if (bsec_status != BSEC_OK && sizeof(bsec_config_iaq) > 4) {
+            bsec_status = bsec_set_configuration(
+                &bsec_config_iaq[4], sizeof(bsec_config_iaq) - 4,
+                work_buffer, SAFE_WORKBUFFER_SIZE
+            );
+        }
+
+        if (bsec_status != BSEC_OK) {
+            Serial.printf("[BSEC] Aviso: bsec_iaq.h incompativel com a lib v%u.%u.%u.%u (cod %d). Usando config interna padrao.\n",
+                          ver.major, ver.minor, ver.major_bugfix, ver.minor_bugfix, bsec_status);
+        } else {
+            Serial.println("[BSEC] Configuracao bsec_iaq.h aplicada com sucesso!");
+        }
+
+        carregarCalibracaoDaMemoria();
+
+        bsec_sensor_configuration_t requested_virtual_sensors[5];
+        bsec_sensor_configuration_t required_sensor_settings[BSEC_MAX_PHYSICAL_SENSOR];
+        uint8_t n_required_sensor_settings = BSEC_MAX_PHYSICAL_SENSOR;
+
+        requested_virtual_sensors[0].sensor_id   = BSEC_OUTPUT_IAQ;
+        requested_virtual_sensors[0].sample_rate = BSEC_SAMPLE_RATE_LP;
+
+        requested_virtual_sensors[1].sensor_id   = BSEC_OUTPUT_STATIC_IAQ;
+        requested_virtual_sensors[1].sample_rate = BSEC_SAMPLE_RATE_LP;
+
+        requested_virtual_sensors[2].sensor_id   = BSEC_OUTPUT_BREATH_VOC_EQUIVALENT;
+        requested_virtual_sensors[2].sample_rate = BSEC_SAMPLE_RATE_LP;
+
+        requested_virtual_sensors[3].sensor_id   = BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE;
+        requested_virtual_sensors[3].sample_rate = BSEC_SAMPLE_RATE_LP;
+
+        requested_virtual_sensors[4].sensor_id   = BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY;
+        requested_virtual_sensors[4].sample_rate = BSEC_SAMPLE_RATE_LP;
+
+        bsec_status = bsec_update_subscription(
+            requested_virtual_sensors, 5,
+            required_sensor_settings, &n_required_sensor_settings
+        );
+        Serial.printf("[BSEC] bsec_update_subscription status: %d\n", bsec_status);
+
+        if (bsec_status >= BSEC_OK) {
+            sensorOk = true;
+            sensor_settings.next_call = 0;
+        }
+    }
+
+    estado = sensorOk ? AQUECENDO : ERRO;
+    if (sensorOk) {
+        Serial.println("BSEC iniciado! Aguardando leituras (a cada 3s)...");
+        Serial.println("[DICA] Terminal serial: 's' salva calibracao | 'r' inspeciona memoria | 'd' despeja o log CSV | 'x' apaga o log.");
+    } else {
+        Serial.printf("Falha ao iniciar (I2C rslt=%d | BSEC status=%d).\n", rslt, bsec_status);
+    }
 }
 
 void loop() {
-    static unsigned long lastReadTime = 0;
-    
-    // Realiza a leitura a cada 5 segundos (5000 ms)
-    if (millis() - lastReadTime > 5000) {
-        readSensorData();
-        printSensorData();
-
-        // Reseta o LED (apaga todas as cores)
-        digitalWrite(pinRED, LOW);
-        digitalWrite(pinGREEN, LOW);
-        digitalWrite(pinBLUE, LOW);
-
-        // Aciona o hardware conforme o nivel
-        // 1 = bom (verde), 2 = moderado (amarelo), 3 = ruim (vermelho), 4 = critico (magenta + buzzer)
-        switch (sensorData.airQualityLevel) {
-            case 1:
-                // LED verde
-                digitalWrite(pinGREEN, HIGH);
-                break;
-            case 2:
-                // LED amarelo
-                digitalWrite(pinRED, HIGH);
-                digitalWrite(pinGREEN, HIGH);
-                break;
-            case 3:
-                // LED vermelho
-                digitalWrite(pinRED, HIGH);
-                break;
-            case 4:
-                // LED magenta + Buzzer
-                digitalWrite(pinRED, HIGH);
-                digitalWrite(pinBLUE, HIGH);
-                activateBuzzer();
-                break;
+    while (Serial.available() > 0) {
+        char cmd = Serial.read();
+        if (cmd == 's' || cmd == 'S') {
+            Serial.println("\n[COMANDO] Forcando salvamento manual na Flash...");
+            salvarCalibracaoNaMemoria(true);
+        } else if (cmd == 'r' || cmd == 'R') {
+            inspecionarMemoriaFlash();
+        } else if (cmd == 'd' || cmd == 'D') {
+            imprimirLog();
+        } else if (cmd == 'x' || cmd == 'X') {
+            apagarLog();
         }
-        // Inicia os parametros de controle do LED
-        LedBeginTime = millis();
-        ledAtivo = true;
-
-        lastReadTime = millis();
     }
 
-    updateBuzzer();
-    updateLED();
-}
+    gerenciarConexao();
 
-// ---------------- FUNCOES DO SENSOR E HARDWARE ----------------
-void readSensorData() {
-    unsigned long endTime = bme.beginReading();
-    if (endTime == 0) {
-        Serial.println("Falha ao iniciar leitura :(");
-        return;
+    if (sensorOk) {
+        if (executarPassoBsec()) {
+            atualizarEstado();
+            registrarLog();
+            salvarCalibracaoNaMemoria(false);
+            enviarParaBlynk();
+            imprimir();
+        } else if (!sensorOk) {
+            estado = ERRO;
+        }
     }
-    
-    delay(50); // Tempo para medicao do sensor
-
-    if (!bme.endReading()) {
-        Serial.println("Falha ao completar leitura :(");
-        return;
-    }
-
-    // Coleta e calculo dos dados basicos
-    sensorData.humidity = bme.humidity;
-    sensorData.temperature = bme.temperature;
-    sensorData.pressure = bme.pressure / 100.0F;
-    sensorData.gasResistance = bme.gas_resistance / 1000.0F; // kOhms
-    sensorData.altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
-    sensorData.dewPoint = dewPointCalculation(sensorData.temperature, sensorData.humidity);
-
-    // Se o sensor ja foi calibrado (R0 > 0), alimenta a fila e usa a media movel
-    if (R0 == 0.0F) {
-        sensorData.gasResistanceMedia = sensorData.gasResistance;
-        sensorData.razao_R = 0.0F;
-    } else {
-        enqueue(&filaResistencia, sensorData.gasResistance);
-        sensorData.gasResistanceMedia = obter_media_fila(&filaResistencia);
-        sensorData.razao_R = sensorData.gasResistanceMedia / R0;
-    }
-
-    sensorData.airQualityLevel = calculateAirQualityLevel(sensorData.razao_R);
-    sensorData.lastUpdate = millis();
-}
-
-float dewPointCalculation(float temperature, float humidity) {
-    float a = 17.271;
-    float b = 237.7;
-    float temp = (a * temperature) / (b + temperature) + log(humidity / 100.0);
-    return (b * temp) / (a - temp);
-}
-
-int calculateAirQualityLevel(float razao_R) {
-    if (razao_R >= 0.75) return 1;      // Excelente / Bom
-    else if (razao_R >= 0.40) return 2; // Moderado
-    else if (razao_R >= 0.20) return 3; // Ruim
-    else return 4;                      // Critico
-}
-
-void printSensorData() {
-    Serial.println("--- Novas Leituras do Sensor ---");
-    Serial.printf("Temperatura: %.2f C\n", sensorData.temperature);
-    Serial.printf("Umidade: %.2f %%\n", sensorData.humidity);
-    Serial.printf("Pressao: %.2f hPa\n", sensorData.pressure);
-    Serial.printf("Gas (Instantaneo): %.2f kOhms\n", sensorData.gasResistance);
-    Serial.printf("Gas (Media Movel [%d/%d]): %.2f kOhms\n",
-                  filaResistencia.tamanho, filaResistencia.capacidade_max, sensorData.gasResistanceMedia);
-    Serial.printf("Altitude: %.2f m\n", sensorData.altitude);
-    Serial.printf("Ponto de Orvalho: %.2f C\n", sensorData.dewPoint);
-    Serial.printf("Razao entre as resistencias (R_medio / R0): %.2f\n", sensorData.razao_R);
-
-    switch (sensorData.airQualityLevel) {
-        case 1:
-            Serial.printf("Nivel de Alerta: Bom\n");
-            break;
-        case 2:
-            Serial.printf("Nivel de Alerta: Moderado\n");
-            break;
-        case 3:
-            Serial.printf("Nivel de Alerta: Ruim\n");
-            break;
-        case 4:
-            Serial.printf("Nivel de Alerta: Critico\n");
-            break;
-    }
-    Serial.println("--------------------------------\n");
-}
-
-void activateBuzzer() {
-    digitalWrite(pinBUZZER, HIGH);
-    BuzzerBeginTime = millis();
-    buzzerAtivo = true;
-}
-
-void updateBuzzer() {
-    if (buzzerAtivo && millis() - BuzzerBeginTime > 1000) {
-        digitalWrite(pinBUZZER, LOW);
-        buzzerAtivo = false;
-    }
-}
-
-void calibrarSensor() {
-    Serial.println("Iniciando calibracao do BME688...");
-    Serial.println("Mantenha o ambiente limpo. Aguarde alguns segundos.");
-
-    // Acende o LED em Branco (Vermelho + Verde + Azul ativos) durante a calibracao
-    digitalWrite(pinRED, HIGH);
-    digitalWrite(pinGREEN, HIGH);
-    digitalWrite(pinBLUE, HIGH);
-
-    int numeroLeituras = 10;
-    float somaDasLeituras = 0.0;
-    float leituraAtual;
-
-    // Descarta a primeirissima leitura, que costuma vir com lixo de memoria ou fria
-    readSensorData(); 
-    delay(500);
-
-    for (int i = 0; i < numeroLeituras; i++) {
-        readSensorData();
-        leituraAtual = sensorData.gasResistance; // Resistencia instantanea em kOhms
-        somaDasLeituras += leituraAtual; 
-
-        Serial.print("#");
-        delay(5000);
-    }
-
-    // Apaga o LED branco ao finalizar a calibracao
-    digitalWrite(pinRED, LOW);
-    digitalWrite(pinGREEN, LOW);
-    digitalWrite(pinBLUE, LOW);
-
-    // Garante que a fila comece limpa apos a calibracao
-    limpar_fila(&filaResistencia);
-
-    // Calcula a media aritmetica de referencia
-    R0 = somaDasLeituras / numeroLeituras;
-    
-    Serial.println();
-    Serial.print("Calibracao concluida! R0 = ");
-    Serial.print(R0);
-    Serial.println(" kOhms\n");
-}
-
-void updateLED() {
-    if (ledAtivo && (millis() - LedBeginTime > 3000)) {
-        digitalWrite(pinRED, LOW);
-        digitalWrite(pinGREEN, LOW);
-        digitalWrite(pinBLUE, LOW);
-        ledAtivo = false;
-    }
-}
-
-// ---------------- IMPLEMENTACAO DAS FUNCOES DA FILA ----------------
-Fila cria_fila(int capacidade_max) {
-    Fila fila;
-    fila.inicio = NULL;
-    fila.fim = NULL;
-    fila.tamanho = 0;
-    fila.capacidade_max = capacidade_max;
-    fila.soma = 0.0F;
-    return fila;
-}
-
-void enqueue(Fila *fila, float valor) {
-    if (fila == NULL) return;
-
-    // Se a fila ja atingiu o limite de N elementos, remove o mais antigo antes de inserir
-    if (fila->tamanho >= fila->capacidade_max) {
-        dequeue(fila);
-    }
-
-    No *novo = (No *)malloc(sizeof(No));
-    if (novo == NULL) {
-        Serial.println("Erro: Falha ao alocar memoria para a fila!");
-        return;
-    }
-    
-    novo->dado = valor;
-    novo->prox = NULL;
-
-    if (fila->fim == NULL) { // Fila estava vazia
-        fila->inicio = novo;
-        fila->fim = novo;
-    } else {
-        fila->fim->prox = novo;
-        fila->fim = novo;
-    }
-
-    fila->soma += valor;
-    fila->tamanho++;
-}
-
-void dequeue(Fila *fila) {
-    if (fila == NULL || fila->inicio == NULL) return;
-
-    No *temp = fila->inicio;
-    fila->soma -= temp->dado; // Subtrai da soma acumulada o valor que esta saindo
-
-    fila->inicio = temp->prox;
-
-    // Caso critico: se a fila ficou vazia apos a remocao, aterra o ponteiro 'fim'
-    if (fila->inicio == NULL) {
-        fila->fim = NULL;
-        fila->soma = 0.0F; // Evita residuos de arredondamento de ponto flutuante
-    }
-
-    free(temp);
-    fila->tamanho--;
-}
-
-float obter_media_fila(Fila *fila) {
-    if (fila == NULL || fila->tamanho == 0) {
-        return 0.0F;
-    }
-    return fila->soma / fila->tamanho;
-}
-
-void limpar_fila(Fila *fila) {
-    if (fila == NULL) return;
-    while (fila->inicio != NULL) {
-        dequeue(fila);
-    }
+    atualizarSaidas(millis());
 }
