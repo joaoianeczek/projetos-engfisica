@@ -1,16 +1,14 @@
-// segredos.h precisa vir ANTES do BlynkSimpleEsp32.h (define TEMPLATE_ID, NAME e AUTH_TOKEN)
+// Projeto: monitor de qualidade do ar ESP32 + BME688 + BSEC + Blynk
+// Leitura CSV enviada pela Serial para coletar_iaq.py (sem LittleFS).
+// segredos.h deve vir ANTES de BlynkSimpleEsp32.h.
 #include "segredos.h"
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <Preferences.h>
 #include <WiFi.h>
-#include <LittleFS.h>
 #include <BlynkSimpleEsp32.h>
 
-// =====================================================================
-//  INCLUDES EXATOS DA SUA PASTA "include/"
-// =====================================================================
 extern "C" {
     #include "bme68x.h"
     #include "bme68x_defs.h"
@@ -19,90 +17,89 @@ extern "C" {
     #include "bsec_iaq.h"
 }
 
-// ---------------- CONFIGURACAO DO HARDWARE ----------------
+// =====================================================================
+//  1. CONFIGURACAO DO HARDWARE E DO BSEC
+// =====================================================================
 constexpr uint8_t PIN_R      = 4;
 constexpr uint8_t PIN_G      = 5;
 constexpr uint8_t PIN_B      = 18;
 constexpr uint8_t PIN_BUZZER = 15;
 
-// Limites SUPERIORES de IAQ (0-500) para Bom, Moderado e Ruim. Acima = Critico.
-constexpr float   LIMITE_SUP[3]   = {100.0f, 200.0f, 300.0f};
-constexpr float   HISTERESE       = 10.0f;
+constexpr float LIMITE_SUP[3] = {100.0f, 200.0f, 300.0f};
+constexpr float HISTERESE = 10.0f;
 constexpr uint8_t ACURACIA_MINIMA = 1;
 
-// Intervalo de backup da calibracao na bancada: 30 minutos (em milissegundos)
 constexpr uint32_t INTERVALO_SALVAR_MS = 30UL * 60UL * 1000UL;
+constexpr uint32_t INTERVALO_TENTATIVA_BLYNK_MS = 10000UL;
+uint32_t ultimaTentativaBlynkMs = 0;
 
-// ---------------- CONFIGURACAO DO BLYNK ----------------
-constexpr uint32_t INTERVALO_TENTATIVA_BLYNK_MS = 10000;
-uint32_t           ultimaTentativaBlynkMs       = 0;
+// O computador recebe os dados pela Serial e salva o CSV via Python.
+// A coleta se inicia quando a acuracia minima e atingida.
+constexpr uint8_t LOG_ACURACIA_MINIMA = ACURACIA_MINIMA;
+uint32_t inicioColetaMs = 0;
+bool coletaIniciada = false;
 
-// ---------------- CONFIGURACAO DO LOG EM ARQUIVO (LittleFS) ----------------
-constexpr const char *ARQUIVO_LOG          = "/log_iaq.csv";
-constexpr uint8_t     LOG_ACURACIA_MINIMA  = ACURACIA_MINIMA;   // mesma condicao que encerra o "Aquecendo". Suba p/ 2 ou 3 se quiser so dados bem calibrados
-constexpr size_t      LOG_TAMANHO_MAX      = 500UL * 1024UL;    // para de gravar ao passar disso (~500 KB)
+constexpr uint32_t SAFE_WORKBUFFER_SIZE =
+    (BSEC_MAX_WORKBUFFER_SIZE > 4096) ? BSEC_MAX_WORKBUFFER_SIZE : 4096;
+constexpr uint32_t SAFE_STATE_BLOB_SIZE =
+    (BSEC_MAX_STATE_BLOB_SIZE > 1024) ? BSEC_MAX_STATE_BLOB_SIZE : 1024;
 
-bool     fsOk        = false;
-bool     logIniciado = false;
-bool     logCheio    = false;
-uint32_t sessaoLog   = 0;   // numero da sessao (incrementa a cada boot que chega a gravar)
-uint32_t inicioLogMs = 0;   // millis() no momento em que o log comecou (t = 0 do grafico)
-
-// Tamanhos seguros de buffer (previne erro caso bsec_datatypes.h seja de versao diferente da .a)
-constexpr uint32_t SAFE_WORKBUFFER_SIZE = (BSEC_MAX_WORKBUFFER_SIZE > 4096) ? BSEC_MAX_WORKBUFFER_SIZE : 4096;
-constexpr uint32_t SAFE_STATE_BLOB_SIZE = (BSEC_MAX_STATE_BLOB_SIZE > 1024) ? BSEC_MAX_STATE_BLOB_SIZE : 1024;
-
-// ---------------- ESTADOS E VARIAVEIS GLOBAIS ----------------
 enum Estado : uint8_t { AQUECENDO, BOM, MODERADO, RUIM, CRITICO, ERRO };
 const char *NOMES[] = {"Aquecendo", "Bom", "Moderado", "Ruim", "Critico", "Erro"};
 
-Estado estado   = AQUECENDO;
-bool   sensorOk = false;
+Estado estado = AQUECENDO;
+bool sensorOk = false;
 
-// Variaveis das leituras
-float   val_iaq       = 0.0f; // IAQ Adaptativo (memoria recente - detecta picos)
-float   val_staticIaq = 0.0f; // IAQ Estatico (absoluto - mede exposicao continua)
-float   val_bVoc      = 0.0f; // Concentracao equivalente de COVs em ppm
-float   val_temp      = 0.0f; // Temperatura compensada (C)
-float   val_umidade   = 0.0f; // Umidade compensada (%)
-uint8_t val_acuracia  = 0;    // Status da calibracao (0 a 3)
+float val_iaq = 0.0f;
+float val_staticIaq = 0.0f;
+float val_bVoc = 0.0f;
+float val_temp = 0.0f;
+float val_umidade = 0.0f;
+uint8_t val_acuracia = 0;
 
-// Controle do BME688 e da BSEC
-struct bme68x_dev   bme;
+struct bme68x_dev bme;
 bsec_bme_settings_t sensor_settings;
-uint8_t             EnderecoI2C = BME68X_I2C_ADDR_HIGH; // Sera descoberto automaticamente
-uint8_t             work_buffer[SAFE_WORKBUFFER_SIZE];
-uint8_t             serialized_state[SAFE_STATE_BLOB_SIZE];
+uint8_t EnderecoI2C = BME68X_I2C_ADDR_HIGH;
+uint8_t work_buffer[SAFE_WORKBUFFER_SIZE];
+uint8_t serialized_state[SAFE_STATE_BLOB_SIZE];
 
-// Controle da Memoria Flash (NVS) e Relogio de 64 bits em nanossegundos
 Preferences preferencias;
-uint32_t    ultimoSaveMs         = 0;
-uint8_t     maiorAcuraciaSalva   = 0;
-uint8_t     maiorAcuraciaTentada = 0;
-uint32_t    totalSavesSessao     = 0;
-uint32_t    ultimoMillis         = 0;
-int64_t     tempoAcumuladoNs     = 0;
+uint32_t ultimoSaveMs = 0;
+uint8_t maiorAcuraciaSalva = 0;
+uint8_t maiorAcuraciaTentada = 0;
+uint32_t totalSavesSessao = 0;
+uint32_t ultimoMillis = 0;
+int64_t tempoAcumuladoNs = 0;
 
-// Prototipo (usado pelo BLYNK_WRITE antes da definicao)
-void salvarCalibracaoNaMemoria(bool forcarAgora);
+void salvarCalibracaoNaMemoria(bool forcarAgora = false);
 
 // =====================================================================
-//  1. CALLBACKS I2C E AUTO-DETECCAO DE ENDERECO (0x77 E 0x76)
+//  2. I2C E DETECCAO AUTOMATICA DO BME688 (0x77 / 0x76)
 // =====================================================================
-BME68X_INTF_RET_TYPE bme68x_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *intf_ptr) {
-    uint8_t dev_addr = *(uint8_t*)intf_ptr;
+BME68X_INTF_RET_TYPE bme68x_i2c_read(uint8_t reg_addr, uint8_t *reg_data,
+                                     uint32_t len, void *intf_ptr) {
+    uint8_t dev_addr = *(uint8_t *)intf_ptr;
     Wire.beginTransmission(dev_addr);
     Wire.write(reg_addr);
     if (Wire.endTransmission(false) != 0) return -1;
-    Wire.requestFrom(dev_addr, (uint8_t)len);
-    for (uint32_t i = 0; i < len && Wire.available(); i++) {
-        reg_data[i] = Wire.read();
+
+    // Leitura em blocos para evitar conversao de comprimento para uint8_t.
+    uint32_t recebidos = 0;
+    while (recebidos < len) {
+        uint8_t bloco = (len - recebidos > 32) ? 32 : (uint8_t)(len - recebidos);
+        size_t lidos = Wire.requestFrom(dev_addr, bloco, (uint8_t)(recebidos + bloco < len));
+        if (lidos != bloco) return -1;
+        for (uint8_t i = 0; i < bloco; i++) {
+            if (!Wire.available()) return -1;
+            reg_data[recebidos++] = Wire.read();
+        }
     }
     return BME68X_OK;
 }
 
-BME68X_INTF_RET_TYPE bme68x_i2c_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t len, void *intf_ptr) {
-    uint8_t dev_addr = *(uint8_t*)intf_ptr;
+BME68X_INTF_RET_TYPE bme68x_i2c_write(uint8_t reg_addr, const uint8_t *reg_data,
+                                      uint32_t len, void *intf_ptr) {
+    uint8_t dev_addr = *(uint8_t *)intf_ptr;
     Wire.beginTransmission(dev_addr);
     Wire.write(reg_addr);
     Wire.write(reg_data, len);
@@ -111,38 +108,35 @@ BME68X_INTF_RET_TYPE bme68x_i2c_write(uint8_t reg_addr, const uint8_t *reg_data,
 }
 
 void bme68x_delay_us(uint32_t period, void *intf_ptr) {
+    (void)intf_ptr;
     delayMicroseconds(period);
 }
 
-// Testa automaticamente os dois enderecos I2C possiveis do BME688 (0x77 e 0x76)
 int8_t inicializarSensorAutoI2C() {
-    const uint8_t enderecosPossiveis[2] = {BME68X_I2C_ADDR_HIGH, BME68X_I2C_ADDR_LOW}; // 0x77 e 0x76
+    const uint8_t enderecosPossiveis[2] = {BME68X_I2C_ADDR_HIGH, BME68X_I2C_ADDR_LOW};
 
     for (uint8_t i = 0; i < 2; i++) {
         EnderecoI2C = enderecosPossiveis[i];
-
         Wire.beginTransmission(EnderecoI2C);
         if (Wire.endTransmission() == 0) {
-            bme.intf     = BME68X_I2C_INTF;
-            bme.read     = bme68x_i2c_read;
-            bme.write    = bme68x_i2c_write;
+            bme.intf = BME68X_I2C_INTF;
+            bme.read = bme68x_i2c_read;
+            bme.write = bme68x_i2c_write;
             bme.delay_us = bme68x_delay_us;
             bme.intf_ptr = &EnderecoI2C;
             bme.amb_temp = 25;
 
             int8_t rslt = bme68x_init(&bme);
             if (rslt == BME68X_OK) {
-                Serial.printf("[I2C] BME688 encontrado e inicializado no endereco 0x%02X!\n", EnderecoI2C);
+                Serial.printf("[I2C] BME688 encontrado em 0x%02X!\n", EnderecoI2C);
                 return BME68X_OK;
             }
         }
     }
-
-    Serial.println("[I2C] ERRO: BME688 nao respondeu nem em 0x77 nem em 0x76!");
+    Serial.println("[I2C] ERRO: BME688 nao encontrado (0x77 / 0x76).");
     return BME68X_E_DEV_NOT_FOUND;
 }
 
-// Gera timestamp em nanossegundos (int64_t) sem risco de overflow do millis()
 int64_t getTimestampNs() {
     uint32_t agora = millis();
     tempoAcumuladoNs += (int64_t)(agora - ultimoMillis) * 1000000LL;
@@ -151,11 +145,11 @@ int64_t getTimestampNs() {
 }
 
 // =====================================================================
-//  2. FUNCOES DE MEMORIA FLASH (CARREGAR NO BOOT E SALVAR CALIBRACAO)
+//  3. CALIBRACAO BSEC: NVS (CONTINUA FUNCIONANDO SEM LITTLEFS)
 // =====================================================================
 void carregarCalibracaoDaMemoria() {
     if (!preferencias.begin("bsec_mem", false)) {
-        Serial.println("[MEMORIA] Erro ao abrir o namespace NVS.");
+        Serial.println("[MEMORIA] Erro ao abrir NVS.");
         return;
     }
 
@@ -167,109 +161,95 @@ void carregarCalibracaoDaMemoria() {
                 serialized_state, tam, work_buffer, SAFE_WORKBUFFER_SIZE
             );
             if (status >= BSEC_OK) {
-                maiorAcuraciaSalva   = preferencias.getUChar("saved_acc", 1);
+                maiorAcuraciaSalva = preferencias.getUChar("saved_acc", 1);
                 maiorAcuraciaTentada = maiorAcuraciaSalva;
-                ultimoSaveMs         = millis();
-                Serial.println("==========================================================");
-                Serial.printf("[MEMORIA] Calibracao restaurada da Flash! (%u bytes | acc salva: %u | status: %d)\n",
-                              (uint32_t)tam, maiorAcuraciaSalva, status);
-                Serial.println("==========================================================");
+                ultimoSaveMs = millis();
+                Serial.printf("[MEMORIA] Calibracao restaurada (%u bytes, acc %u, status %d).\n",
+                              (unsigned)tam, maiorAcuraciaSalva, status);
             } else {
-                Serial.printf("[MEMORIA] Estado salvo invalido (erro %d). Iniciando do zero.\n", status);
+                Serial.printf("[MEMORIA] Estado invalido: %d. Iniciando do zero.\n", status);
             }
         }
     } else {
-        Serial.println("[MEMORIA] Nenhuma calibracao salva encontrada. Iniciando do zero.");
+        Serial.println("[MEMORIA] Sem calibracao salva; iniciando do zero.");
     }
     preferencias.end();
 }
 
-void salvarCalibracaoNaMemoria(bool forcarAgora = false) {
+void salvarCalibracaoNaMemoria(bool forcarAgora) {
     uint32_t agora = millis();
+    bool subiuDeNivel = (val_acuracia > maiorAcuraciaTentada);
+    bool salvarPeriodico =
+        (val_acuracia >= 1 && (agora - ultimoSaveMs >= INTERVALO_SALVAR_MS));
 
-    // Usa maiorAcuraciaTentada para nao ficar preso num loop infinito se bsec_get_state falhar
-    bool subiuDeNivel    = (val_acuracia > maiorAcuraciaTentada);
-    bool salvarPeriodico = (val_acuracia >= 1 && (agora - ultimoSaveMs >= INTERVALO_SALVAR_MS));
+    if (!forcarAgora && !subiuDeNivel && !salvarPeriodico) return;
 
-    if (forcarAgora || subiuDeNivel || salvarPeriodico) {
-        if (val_acuracia > maiorAcuraciaTentada) {
-            maiorAcuraciaTentada = val_acuracia;
-        }
-        ultimoSaveMs = agora;
+    if (val_acuracia > maiorAcuraciaTentada) maiorAcuraciaTentada = val_acuracia;
+    ultimoSaveMs = agora;
 
-        uint32_t n_serialized_state = 0;
+    uint32_t n_serialized_state = 0;
+    bsec_library_return_t status = bsec_get_state(
+        0, serialized_state, SAFE_STATE_BLOB_SIZE,
+        work_buffer, SAFE_WORKBUFFER_SIZE, &n_serialized_state
+    );
 
-        // Tentativa 1: Usa os buffers expandidos seguros (SAFE_STATE_BLOB_SIZE / SAFE_WORKBUFFER_SIZE)
-        bsec_library_return_t status = bsec_get_state(
-            0, serialized_state, SAFE_STATE_BLOB_SIZE,
-            work_buffer, SAFE_WORKBUFFER_SIZE, &n_serialized_state
+    if (status < BSEC_OK) {
+        status = bsec_get_state(
+            0, serialized_state, BSEC_MAX_STATE_BLOB_SIZE,
+            work_buffer, BSEC_MAX_WORKBUFFER_SIZE, &n_serialized_state
         );
+    }
 
-        // Tentativa 2: Se a lib exigir exatamente a constante do header, tenta com BSEC_MAX_STATE_BLOB_SIZE
-        if (status < BSEC_OK) {
-            status = bsec_get_state(
-                0, serialized_state, BSEC_MAX_STATE_BLOB_SIZE,
-                work_buffer, BSEC_MAX_WORKBUFFER_SIZE, &n_serialized_state
-            );
-        }
-
-        if (status >= BSEC_OK && n_serialized_state > 0) {
-            if (preferencias.begin("bsec_mem", false)) {
-                size_t gravados = preferencias.putBytes("state", serialized_state, n_serialized_state);
-                if (val_acuracia > maiorAcuraciaSalva) {
-                    maiorAcuraciaSalva = val_acuracia;
-                }
+    if (status >= BSEC_OK && n_serialized_state > 0 &&
+        n_serialized_state <= SAFE_STATE_BLOB_SIZE) {
+        if (preferencias.begin("bsec_mem", false)) {
+            size_t gravados = preferencias.putBytes("state", serialized_state, n_serialized_state);
+            if (gravados == n_serialized_state) {
+                if (val_acuracia > maiorAcuraciaSalva) maiorAcuraciaSalva = val_acuracia;
                 preferencias.putUChar("saved_acc", maiorAcuraciaSalva);
-                preferencias.end();
-
                 totalSavesSessao++;
-
-                const char *motivo = forcarAgora ? "Comando manual (serial 's' ou botao Blynk)" :
-                                     (subiuDeNivel ? "Subiu de nivel de acuracia" : "Backup periodico (30 min)");
-
-                Serial.println("\n**********************************************************");
-                Serial.printf(">>> [FLASH NVS] CALIBRACAO SALVA COM SUCESSO! (Save #%u) <<<\n", totalSavesSessao);
-                Serial.printf(">>> Motivo: %s\n", motivo);
-                Serial.printf(">>> Status BSEC: %d | Acuracia atual: %u | Gravados: %u/%u bytes\n",
-                              status, val_acuracia, (uint32_t)gravados, n_serialized_state);
-                Serial.println("**********************************************************\n");
+                const char *motivo = forcarAgora ? "Manual" :
+                    (subiuDeNivel ? "Nova acuracia" : "Backup 30 min");
+                Serial.printf("[FLASH NVS] Calibracao salva! #%u | %s | acc %u | %u bytes.\n",
+                              totalSavesSessao, motivo, val_acuracia, (unsigned)gravados);
             } else {
-                Serial.println("\n[ERRO FLASH] Falha ao abrir NVS 'bsec_mem' para escrita!\n");
+                Serial.printf("[FLASH NVS] Gravacao incompleta: %u/%u bytes.\n",
+                              (unsigned)gravados, (unsigned)n_serialized_state);
             }
+            preferencias.end();
         } else {
-            Serial.printf("\n[AVISO BSEC] bsec_get_state indisponivel (status=%d | tam=%u | Header MAX_STATE=%u, MAX_WORK=%u).\n",
-                          status, n_serialized_state, (uint32_t)BSEC_MAX_STATE_BLOB_SIZE, (uint32_t)BSEC_MAX_WORKBUFFER_SIZE);
+            Serial.println("[FLASH NVS] Erro ao abrir bsec_mem para escrita.");
         }
+    } else {
+        Serial.printf("[BSEC] bsec_get_state falhou (status=%d, bytes=%u).\n",
+                      status, (unsigned)n_serialized_state);
     }
 }
 
 void inspecionarMemoriaFlash() {
     if (!preferencias.begin("bsec_mem", true)) {
-        Serial.println("\n[INSPECAO FLASH] Namespace 'bsec_mem' ainda nao existe na NVS.\n");
+        Serial.println("[FLASH] Namespace bsec_mem nao encontrado.");
         return;
     }
     bool temState = preferencias.isKey("state");
-    size_t tam    = temState ? preferencias.getBytesLength("state") : 0;
-    uint8_t acc   = preferencias.getUChar("saved_acc", 0);
+    size_t tam = temState ? preferencias.getBytesLength("state") : 0;
+    uint8_t acc = preferencias.getUChar("saved_acc", 0);
     preferencias.end();
 
-    Serial.println("\n------------------ STATUS DA FLASH NVS ------------------");
-    Serial.printf("Chave 'state' existe? %s | Tamanho: %u bytes | Maior acc salva: %u | Saves nesta sessao: %u\n",
-                  temState ? "SIM" : "NAO", (uint32_t)tam, acc, totalSavesSessao);
-    Serial.printf("Constantes do Header -> BSEC_MAX_STATE_BLOB_SIZE: %u | BSEC_MAX_WORKBUFFER_SIZE: %u\n",
-                  (uint32_t)BSEC_MAX_STATE_BLOB_SIZE, (uint32_t)BSEC_MAX_WORKBUFFER_SIZE);
-    Serial.println("---------------------------------------------------------\n");
+    Serial.printf("[FLASH] Estado: %s | %u bytes | acc salva: %u | saves desta sessao: %u\n",
+                  temState ? "SIM" : "NAO", (unsigned)tam, acc, totalSavesSessao);
+    Serial.printf("[FLASH] MAX_STATE=%u | MAX_WORK=%u\n",
+                  (unsigned)BSEC_MAX_STATE_BLOB_SIZE, (unsigned)BSEC_MAX_WORKBUFFER_SIZE);
 }
 
 // =====================================================================
-//  3. BLYNK IOT (WiFi nao bloqueante)
+//  4. BLYNK
+//  V0 IAQ | V1 sIAQ | V2 bVOC | V3 Temp | V4 Umidade | V5 acc | V6 estado
+//  V7 botao para salvar calibracao
 // =====================================================================
-// V0 IAQ | V1 sIAQ | V2 bVOC | V3 Temp | V4 Umidade | V5 Acuracia | V6 Estado (string)
-// V7 (botao, entrada): salva calibracao na Flash
-
 BLYNK_WRITE(V7) {
     if (param.asInt() == 1) {
-        Serial.println("\n[BLYNK] Salvamento manual solicitado pelo app.");
+        Serial.println("[BLYNK] Salvamento manual solicitado.");
         salvarCalibracaoNaMemoria(true);
     }
 }
@@ -281,29 +261,26 @@ BLYNK_CONNECTED() {
 void iniciarConexao() {
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);   // retorna na hora; conecta em background
-    Blynk.config(BLYNK_AUTH_TOKEN);     // so configura, nao conecta
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Blynk.config(BLYNK_AUTH_TOKEN);
 }
 
 void gerenciarConexao() {
-    if (WiFi.status() != WL_CONNECTED) return;  // auto-reconnect cuida do WiFi
-
+    if (WiFi.status() != WL_CONNECTED) return;
     if (Blynk.connected()) {
         Blynk.run();
         return;
     }
-
     uint32_t agora = millis();
     if (agora - ultimaTentativaBlynkMs >= INTERVALO_TENTATIVA_BLYNK_MS) {
         ultimaTentativaBlynkMs = agora;
         Serial.println("[BLYNK] Tentando conectar...");
-        Blynk.connect(3000);  // bloqueia no maximo 3 s
+        Blynk.connect(3000);
     }
 }
 
 void enviarParaBlynk() {
     if (!Blynk.connected()) return;
-
     Blynk.virtualWrite(V0, val_iaq);
     Blynk.virtualWrite(V1, val_staticIaq);
     Blynk.virtualWrite(V2, val_bVoc);
@@ -314,77 +291,27 @@ void enviarParaBlynk() {
 }
 
 // =====================================================================
-//  3.5 LOG EM ARQUIVO CSV (LittleFS) - so grava depois do aquecimento
+//  5. LOG SERIAL: PYTHON SALVA CSV E GERA GRAFICOS
+//  DATA,tempo_s,iaq,iaq_estatico,bvoc_ppm,temperatura_c,umidade_pct,acuracia,estado
 // =====================================================================
-// Formato: sessao,tempo_s,iaq,iaq_estatico,acuracia
-// tempo_s = segundos desde o fim do aquecimento (t = 0 na primeira linha da sessao)
-void registrarLog() {
-    if (!fsOk || logCheio) return;
-    if (estado == AQUECENDO || val_acuracia < LOG_ACURACIA_MINIMA) return;
+void enviarDadosPython() {
+    if (estado == AQUECENDO || estado == ERRO) return;
+    if (val_acuracia < LOG_ACURACIA_MINIMA) return;
 
-    if (!logIniciado) {
-        if (preferencias.begin("log_iaq", false)) {
-            sessaoLog = preferencias.getUInt("sessao", 0) + 1;
-            preferencias.putUInt("sessao", sessaoLog);
-            preferencias.end();
-        }
-        inicioLogMs = millis();
-        logIniciado = true;
-        Serial.printf("[LOG] Aquecimento concluido. Iniciando log (sessao %u) em %s\n", sessaoLog, ARQUIVO_LOG);
+    if (!coletaIniciada) {
+        inicioColetaMs = millis();
+        coletaIniciada = true;
+        Serial.println("[PYTHON] Coleta iniciada (primeira leitura valida).");
     }
 
-    bool novoArquivo = !LittleFS.exists(ARQUIVO_LOG);
-    File f = LittleFS.open(ARQUIVO_LOG, FILE_APPEND);
-    if (!f) {
-        Serial.println("[LOG] ERRO: nao foi possivel abrir o arquivo de log.");
-        return;
-    }
-
-    if (f.size() >= LOG_TAMANHO_MAX) {
-        f.close();
-        logCheio = true;
-        Serial.println("[LOG] Arquivo cheio. Gravacao interrompida (use 'd' para baixar e 'x' para apagar).");
-        return;
-    }
-
-    if (novoArquivo) f.println("sessao,tempo_s,iaq,iaq_estatico,acuracia");
-    f.printf("%u,%.1f,%.1f,%.1f,%u\n",
-             sessaoLog, (millis() - inicioLogMs) / 1000.0f, val_iaq, val_staticIaq, val_acuracia);
-    f.close();
-}
-
-// Despeja o CSV inteiro na serial (copie do monitor serial e salve como .csv)
-void imprimirLog() {
-    if (!fsOk || !LittleFS.exists(ARQUIVO_LOG)) {
-        Serial.println("\n[LOG] Nenhum arquivo de log ainda (ele so e criado depois do aquecimento).\n");
-        return;
-    }
-    File f = LittleFS.open(ARQUIVO_LOG, FILE_READ);
-    if (!f) {
-        Serial.println("\n[LOG] ERRO ao abrir o log para leitura.\n");
-        return;
-    }
-    Serial.printf("\n----- INICIO %s (%u bytes) -----\n", ARQUIVO_LOG, (uint32_t)f.size());
-    uint8_t buf[256];
-    while (f.available()) {
-        size_t n = f.read(buf, sizeof(buf));
-        Serial.write(buf, n);
-    }
-    f.close();
-    Serial.println("----- FIM DO LOG -----\n");
-}
-
-void apagarLog() {
-    if (fsOk && LittleFS.exists(ARQUIVO_LOG) && LittleFS.remove(ARQUIVO_LOG)) {
-        logCheio = false;
-        Serial.println("\n[LOG] Arquivo de log apagado.\n");
-    } else {
-        Serial.println("\n[LOG] Nada para apagar.\n");
-    }
+    float tempo_s = (millis() - inicioColetaMs) / 1000.0f;
+    Serial.printf("DATA,%.2f,%.2f,%.2f,%.3f,%.2f,%.2f,%u,%s\n",
+                  tempo_s, val_iaq, val_staticIaq, val_bVoc,
+                  val_temp, val_umidade, val_acuracia, NOMES[estado]);
 }
 
 // =====================================================================
-//  4. LOGICA DE CLASSIFICACAO, HISTERESE, LEDS, BUZZER E SERIAL
+//  6. CLASSIFICACAO, LEDS, BUZZER E SERIAL
 // =====================================================================
 bool ciclo(uint32_t agora, uint32_t periodo, uint32_t ligado) {
     return (agora % periodo) < ligado;
@@ -417,21 +344,19 @@ void atualizarEstado() {
 void imprimir() {
     uint32_t decorridoMs = millis() - ultimoSaveMs;
     uint32_t restanteSeg = (decorridoMs < INTERVALO_SALVAR_MS)
-                           ? ((INTERVALO_SALVAR_MS - decorridoMs) / 1000UL)
-                           : 0;
+        ? ((INTERVALO_SALVAR_MS - decorridoMs) / 1000UL) : 0;
     uint32_t minRest = restanteSeg / 60UL;
     uint32_t segRest = restanteSeg % 60UL;
 
     Serial.printf("IAQ: %.0f | sIAQ: %.0f (acc %u) | bVOC: %.2f ppm | T: %.1f C | UR: %.1f%% | %s | [Flash: acc %u | Save #%u | Prox: %02um%02us] | Blynk: %s\n",
                   val_iaq, val_staticIaq, val_acuracia, val_bVoc,
-                  val_temp, val_umidade, NOMES[estado],
-                  maiorAcuraciaSalva, totalSavesSessao, minRest, segRest,
+                  val_temp, val_umidade, NOMES[estado], maiorAcuraciaSalva,
+                  totalSavesSessao, (unsigned)minRest, (unsigned)segRest,
                   Blynk.connected() ? "on" : "off");
 }
 
 void atualizarSaidas(uint32_t agora) {
     bool r = false, g = false, b = false, buzzer = false;
-
     switch (estado) {
         case AQUECENDO:
             b = ciclo(agora, 2000, 1000);
@@ -447,14 +372,13 @@ void atualizarSaidas(uint32_t agora) {
             r = true;
             break;
         case CRITICO:
-            r      = ciclo(agora, 1000, 500);
+            r = ciclo(agora, 1000, 500);
             buzzer = ciclo(agora, 1000, 200);
             break;
         case ERRO:
             r = g = b = ciclo(agora, 400, 200);
             break;
     }
-
     digitalWrite(PIN_R, r);
     digitalWrite(PIN_G, g);
     digitalWrite(PIN_B, b);
@@ -462,14 +386,11 @@ void atualizarSaidas(uint32_t agora) {
 }
 
 // =====================================================================
-//  5. PASSO DE LEITURA DO SENSOR + PROCESSAMENTO BSEC
+//  7. LEITURA BME688 + PROCESSAMENTO BSEC
 // =====================================================================
 bool executarPassoBsec() {
     int64_t time_stamp = getTimestampNs();
-
-    if (time_stamp < sensor_settings.next_call) {
-        return false;
-    }
+    if (time_stamp < sensor_settings.next_call) return false;
 
     bsec_library_return_t bsec_status = bsec_sensor_control(time_stamp, &sensor_settings);
     if (bsec_status < BSEC_OK) {
@@ -479,21 +400,20 @@ bool executarPassoBsec() {
     }
 
     if (sensor_settings.trigger_measurement == 1) {
-        struct bme68x_conf       conf;
+        struct bme68x_conf conf;
         struct bme68x_heatr_conf heatr_conf;
 
-        conf.os_hum  = sensor_settings.humidity_oversampling;
+        conf.os_hum = sensor_settings.humidity_oversampling;
         conf.os_temp = sensor_settings.temperature_oversampling;
         conf.os_pres = sensor_settings.pressure_oversampling;
-        conf.filter  = BME68X_FILTER_OFF;
-        conf.odr     = BME68X_ODR_NONE;
+        conf.filter = BME68X_FILTER_OFF;
+        conf.odr = BME68X_ODR_NONE;
         bme68x_set_conf(&conf, &bme);
 
-        heatr_conf.enable     = sensor_settings.run_gas;
+        heatr_conf.enable = sensor_settings.run_gas;
         heatr_conf.heatr_temp = sensor_settings.heater_temperature;
-        heatr_conf.heatr_dur  = sensor_settings.heater_duration;
+        heatr_conf.heatr_dur = sensor_settings.heater_duration;
         bme68x_set_heatr_conf(BME68X_FORCED_MODE, &heatr_conf, &bme);
-
         bme68x_set_op_mode(BME68X_FORCED_MODE, &bme);
 
         uint32_t duracao_us = bme68x_get_meas_dur(BME68X_FORCED_MODE, &conf, &bme)
@@ -505,31 +425,33 @@ bool executarPassoBsec() {
         struct bme68x_data data;
         uint8_t n_fields = 0;
 
-        if (bme68x_get_data(BME68X_FORCED_MODE, &data, &n_fields, &bme) == BME68X_OK && n_fields > 0) {
+        if (bme68x_get_data(BME68X_FORCED_MODE, &data, &n_fields, &bme) == BME68X_OK
+            && n_fields > 0) {
             bsec_input_t inputs[BSEC_MAX_PHYSICAL_SENSOR];
             uint8_t n_inputs = 0;
 
             if (sensor_settings.process_data & BSEC_PROCESS_TEMPERATURE) {
-                inputs[n_inputs].sensor_id  = BSEC_INPUT_TEMPERATURE;
-                inputs[n_inputs].signal     = data.temperature;
+                inputs[n_inputs].sensor_id = BSEC_INPUT_TEMPERATURE;
+                inputs[n_inputs].signal = data.temperature;
                 inputs[n_inputs].time_stamp = time_stamp;
                 n_inputs++;
             }
             if (sensor_settings.process_data & BSEC_PROCESS_HUMIDITY) {
-                inputs[n_inputs].sensor_id  = BSEC_INPUT_HUMIDITY;
-                inputs[n_inputs].signal     = data.humidity;
+                inputs[n_inputs].sensor_id = BSEC_INPUT_HUMIDITY;
+                inputs[n_inputs].signal = data.humidity;
                 inputs[n_inputs].time_stamp = time_stamp;
                 n_inputs++;
             }
             if (sensor_settings.process_data & BSEC_PROCESS_PRESSURE) {
-                inputs[n_inputs].sensor_id  = BSEC_INPUT_PRESSURE;
-                inputs[n_inputs].signal     = data.pressure;
+                inputs[n_inputs].sensor_id = BSEC_INPUT_PRESSURE;
+                inputs[n_inputs].signal = data.pressure;
                 inputs[n_inputs].time_stamp = time_stamp;
                 n_inputs++;
             }
-            if ((sensor_settings.process_data & BSEC_PROCESS_GAS) && (data.status & BME68X_GASM_VALID_MSK)) {
-                inputs[n_inputs].sensor_id  = BSEC_INPUT_GASRESISTOR;
-                inputs[n_inputs].signal     = data.gas_resistance;
+            if ((sensor_settings.process_data & BSEC_PROCESS_GAS) &&
+                (data.status & BME68X_GASM_VALID_MSK)) {
+                inputs[n_inputs].sensor_id = BSEC_INPUT_GASRESISTOR;
+                inputs[n_inputs].signal = data.gas_resistance;
                 inputs[n_inputs].time_stamp = time_stamp;
                 n_inputs++;
             }
@@ -543,7 +465,7 @@ bool executarPassoBsec() {
                     for (uint8_t i = 0; i < n_outputs; i++) {
                         switch (outputs[i].sensor_id) {
                             case BSEC_OUTPUT_IAQ:
-                                val_iaq      = outputs[i].signal;
+                                val_iaq = outputs[i].signal;
                                 val_acuracia = outputs[i].accuracy;
                                 break;
                             case BSEC_OUTPUT_STATIC_IAQ:
@@ -569,7 +491,7 @@ bool executarPassoBsec() {
 }
 
 // =====================================================================
-//  6. SETUP E LOOP PRINCIPAL
+//  8. SETUP E LOOP
 // =====================================================================
 void setup() {
     Serial.begin(115200);
@@ -581,17 +503,14 @@ void setup() {
     pinMode(PIN_BUZZER, OUTPUT);
 
     Wire.begin();
-    iniciarConexao();   // WiFi + Blynk em background (nao bloqueia)
-
-    fsOk = LittleFS.begin(true);   // true = formata sozinho na primeira vez
-    Serial.println(fsOk ? "[LOG] LittleFS montado." : "[LOG] ERRO: falha ao montar LittleFS (log desativado).");
+    iniciarConexao();
 
     int8_t rslt = inicializarSensorAutoI2C();
 
     bsec_library_return_t bsec_status = bsec_init();
     bsec_version_t ver;
     bsec_get_version(&ver);
-    Serial.printf("[BSEC] Versao da lib: %u.%u.%u.%u | bsec_init status: %d\n",
+    Serial.printf("[BSEC] Versao %u.%u.%u.%u | init=%d\n",
                   ver.major, ver.minor, ver.major_bugfix, ver.minor_bugfix, bsec_status);
 
     if (rslt == BME68X_OK && bsec_status == BSEC_OK) {
@@ -608,10 +527,10 @@ void setup() {
         }
 
         if (bsec_status != BSEC_OK) {
-            Serial.printf("[BSEC] Aviso: bsec_iaq.h incompativel com a lib v%u.%u.%u.%u (cod %d). Usando config interna padrao.\n",
-                          ver.major, ver.minor, ver.major_bugfix, ver.minor_bugfix, bsec_status);
+            Serial.printf("[BSEC] Aviso: bsec_iaq.h incompativel (status %d). Config padrao.\n",
+                          bsec_status);
         } else {
-            Serial.println("[BSEC] Configuracao bsec_iaq.h aplicada com sucesso!");
+            Serial.println("[BSEC] Configuracao aplicada com sucesso.");
         }
 
         carregarCalibracaoDaMemoria();
@@ -620,26 +539,22 @@ void setup() {
         bsec_sensor_configuration_t required_sensor_settings[BSEC_MAX_PHYSICAL_SENSOR];
         uint8_t n_required_sensor_settings = BSEC_MAX_PHYSICAL_SENSOR;
 
-        requested_virtual_sensors[0].sensor_id   = BSEC_OUTPUT_IAQ;
+        requested_virtual_sensors[0].sensor_id = BSEC_OUTPUT_IAQ;
         requested_virtual_sensors[0].sample_rate = BSEC_SAMPLE_RATE_LP;
-
-        requested_virtual_sensors[1].sensor_id   = BSEC_OUTPUT_STATIC_IAQ;
+        requested_virtual_sensors[1].sensor_id = BSEC_OUTPUT_STATIC_IAQ;
         requested_virtual_sensors[1].sample_rate = BSEC_SAMPLE_RATE_LP;
-
-        requested_virtual_sensors[2].sensor_id   = BSEC_OUTPUT_BREATH_VOC_EQUIVALENT;
+        requested_virtual_sensors[2].sensor_id = BSEC_OUTPUT_BREATH_VOC_EQUIVALENT;
         requested_virtual_sensors[2].sample_rate = BSEC_SAMPLE_RATE_LP;
-
-        requested_virtual_sensors[3].sensor_id   = BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE;
+        requested_virtual_sensors[3].sensor_id = BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE;
         requested_virtual_sensors[3].sample_rate = BSEC_SAMPLE_RATE_LP;
-
-        requested_virtual_sensors[4].sensor_id   = BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY;
+        requested_virtual_sensors[4].sensor_id = BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY;
         requested_virtual_sensors[4].sample_rate = BSEC_SAMPLE_RATE_LP;
 
         bsec_status = bsec_update_subscription(
             requested_virtual_sensors, 5,
             required_sensor_settings, &n_required_sensor_settings
         );
-        Serial.printf("[BSEC] bsec_update_subscription status: %d\n", bsec_status);
+        Serial.printf("[BSEC] Subscription status: %d\n", bsec_status);
 
         if (bsec_status >= BSEC_OK) {
             sensorOk = true;
@@ -649,10 +564,11 @@ void setup() {
 
     estado = sensorOk ? AQUECENDO : ERRO;
     if (sensorOk) {
-        Serial.println("BSEC iniciado! Aguardando leituras (a cada 3s)...");
-        Serial.println("[DICA] Terminal serial: 's' salva calibracao | 'r' inspeciona memoria | 'd' despeja o log CSV | 'x' apaga o log.");
+        Serial.println("BSEC iniciado. Aguardando leituras (~3 s)...");
+        Serial.println("[DICA] 's' salva calibracao | 'r' inspeciona NVS.");
+        Serial.println("[PYTHON] Execute coletar_iaq.py na porta serial para gravar o CSV.");
     } else {
-        Serial.printf("Falha ao iniciar (I2C rslt=%d | BSEC status=%d).\n", rslt, bsec_status);
+        Serial.printf("Falha ao iniciar (I2C=%d | BSEC=%d).\n", rslt, bsec_status);
     }
 }
 
@@ -660,14 +576,10 @@ void loop() {
     while (Serial.available() > 0) {
         char cmd = Serial.read();
         if (cmd == 's' || cmd == 'S') {
-            Serial.println("\n[COMANDO] Forcando salvamento manual na Flash...");
+            Serial.println("[COMANDO] Salvando calibracao...");
             salvarCalibracaoNaMemoria(true);
         } else if (cmd == 'r' || cmd == 'R') {
             inspecionarMemoriaFlash();
-        } else if (cmd == 'd' || cmd == 'D') {
-            imprimirLog();
-        } else if (cmd == 'x' || cmd == 'X') {
-            apagarLog();
         }
     }
 
@@ -676,7 +588,7 @@ void loop() {
     if (sensorOk) {
         if (executarPassoBsec()) {
             atualizarEstado();
-            registrarLog();
+            enviarDadosPython();
             salvarCalibracaoNaMemoria(false);
             enviarParaBlynk();
             imprimir();
